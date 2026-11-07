@@ -51,7 +51,7 @@ def default_data_dir():
 
 def load_settings():
     s = {"data_dir": "", "thumb_mode": 1, "hash_mode": "quick", "sim_threshold": 0.8,
-         "path_map": []}
+         "path_map": [], "sheet_url": "", "sa_json": "", "sheet_auto": False, "col_widths": {}, "side_w": 300, "side_show": True}
     try:
         with open(SETTINGS_PATH, encoding="utf-8") as f:
             s.update(json.load(f))
@@ -99,7 +99,7 @@ class Store:
 
     @staticmethod
     def _dump(it):
-        return json.dumps({k: v for k, v in it.items() if k not in ("flags", "ut", "lpath")},
+        return json.dumps({k: v for k, v in it.items() if k not in ("flags", "ut", "lpath", "sy")},
                           sort_keys=True, ensure_ascii=False)
 
     def _remember(self, name, data):
@@ -472,6 +472,327 @@ def job_scan(root, group_root_files, existing_items, mode, hash_mode, thr, thumb
     job_analyze([dict(it) for it in existing_items] + new, hash_mode, thr, q)
 
 
+# ----------------------------------------------------------------- ファイル移動
+def job_move(moves, dest_dir, set_group, pmap, q):
+    """moves: [(id, この端末でのパス)] を dest_dir へ実際に移動する。"""
+    pmap = [tuple(x) for x in pmap]
+    total = len(moves)
+    group = os.path.basename(os.path.normpath(dest_dir)) if set_group else None
+    for i, (iid, src) in enumerate(moves, 1):
+        q.put(("progress", i, total, f"移動中 ({i}/{total}) {os.path.basename(src)}"))
+        dst = os.path.join(dest_dir, os.path.basename(src))
+        try:
+            if not os.path.exists(src):
+                raise FileNotFoundError("移動元が見つかりません")
+            if os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dst)):
+                raise ValueError("移動先が同じフォルダです")
+            if os.path.exists(dst):
+                raise FileExistsError("移動先に同名のファイルがあります")
+            shutil.move(src, dst)
+            q.put(("moved", iid, to_canon(dst, pmap), group))
+        except Exception as e:  # noqa
+            q.put(("move_err", f"{os.path.basename(src)}: {e}"))
+
+
+# ----------------------------------------------------------------- スプレッドシート連携 (Google Sheets API)
+SHEET_COLS = ["id", "タイトル", "グループ", "ジャンル", "時間(秒)", "サイズ(byte)", "パス", "更新"]
+
+
+def sheet_open(s):
+    try:
+        import gspread
+    except ImportError:
+        raise RuntimeError("gspread が未インストールです。  pip install gspread  を実行してください。")
+    if not s.get("sheet_url") or not s.get("sa_json"):
+        raise RuntimeError("設定でスプレッドシートのURLとサービスアカウントJSONを指定してください。")
+    try:
+        with open(s["sa_json"], encoding="utf-8") as f:
+            kind = json.load(f)
+    except (OSError, ValueError) as e:
+        raise RuntimeError(f"認証JSONを読めません: {s['sa_json']}\n{e}")
+    if kind.get("type") == "service_account":
+        gc = gspread.service_account(filename=s["sa_json"])
+    else:  # OAuthクライアント(client_secret.json): 初回のみブラウザで許可。トークンはアプリ専用ファイルに保存
+        tok = os.path.join(os.path.dirname(SETTINGS_PATH), "sheets_token.json")
+        gc = gspread.oauth(credentials_filename=s["sa_json"], authorized_user_filename=tok)
+    u = s["sheet_url"].strip()
+    return gc.open_by_url(u) if u.startswith("http") else gc.open_by_key(u)
+
+
+def _sy(title, group, genre, path):
+    return json.dumps([title, group, genre, path], ensure_ascii=False)
+
+
+def _int(v):
+    try:
+        return int(float(str(v).replace(",", "").strip()))
+    except ValueError:
+        return 0
+
+
+def _is_app_tab(vals):
+    return bool(vals) and vals[0][:1] == ["id"]
+
+
+def _blank(vals):
+    return not any(c.strip() for r in vals for c in r)
+
+
+def sync_one(sh, ws, vals, list_name, items, deleted):
+    """1つの一覧とシート(タブ)を双方向同期する。ws が None なら新規作成。
+    戻り値: (updates, new, syncs)。シート側で編集された項目(タイトル/グループ/ジャンル/パス)は取り込み、
+    アプリ側の変更とシート未登録の項目はシートへ書き出す。"""
+    if ws is None:
+        ws = sh.add_worksheet(title=list_name, rows=max(100, len(items) + 50), cols=len(SHEET_COLS))
+        vals = []
+    remote, norows = {}, []
+    if not _blank(vals):
+        if not _is_app_tab(vals):
+            raise RuntimeError(f"シート「{list_name}」は本アプリの形式ではありません(1行目の先頭が id ではない)。\n"
+                               "既存データを壊さないため同期を中止しました。別の名前の一覧で同期してください。")
+        idx = {h.strip(): i for i, h in enumerate(vals[0])}
+
+        def g(r, name):
+            i = idx.get(name)
+            return r[i].strip() if i is not None and i < len(r) else ""
+        for r in vals[1:]:
+            if not any(c.strip() for c in r):
+                continue
+            rec = {"title": g(r, "タイトル"), "group": g(r, "グループ"), "genre": g(r, "ジャンル"),
+                   "path": g(r, "パス"), "duration": _int(g(r, "時間(秒)")), "size": _int(g(r, "サイズ(byte)"))}
+            if not rec["title"]:
+                continue
+            if g(r, "id"):
+                remote[g(r, "id")] = rec
+            else:
+                norows.append(rec)
+    byid = {it["id"]: it for it in items}
+    updates, new = {}, []
+    for iid, rec in remote.items():
+        it = byid.get(iid)
+        if it:
+            if it.get("sy") and _sy(rec["title"], rec["group"], rec["genre"], rec["path"]) != it["sy"]:
+                updates[iid] = {k: rec[k] for k in ("title", "group", "genre", "path")}
+        elif iid not in deleted:
+            new.append(dict(rec, id=iid, mtime=0, hq="", hf="", thumb="", thumb_mode=0, flags=[]))
+    for rec in norows:
+        iid = item_id("sheet:" + list_name + ":" + rec["title"] + ":" + rec["path"])
+        if iid not in byid and iid not in remote:
+            new.append(dict(rec, id=iid, mtime=0, hq="", hf="", thumb="", thumb_mode=0, flags=[]))
+    final = [dict(it, **updates.get(it["id"], {})) for it in items] + new
+    rows = [SHEET_COLS]
+    for it in final:
+        rows.append([it["id"], it["title"], it["group"], it["genre"], int(it.get("duration") or 0),
+                     it.get("size", 0), it["path"],
+                     time.strftime("%Y-%m-%d %H:%M", time.localtime(it.get("ut") or time.time()))])
+    ws.clear()
+    ws.resize(rows=max(len(rows) + 20, 100), cols=len(SHEET_COLS))
+    ws.update(range_name="A1", values=rows, value_input_option="RAW")
+    syncs = {it["id"]: _sy(it["title"], it["group"], it["genre"], it["path"]) for it in final}
+    return updates, new, syncs
+
+
+def apply_sheet_result(items, upd, new, syncs):
+    """sync_one の結果を items(リスト)へ反映する。"""
+    for it in items:
+        it.update(upd.get(it["id"], {}))
+        if it["id"] in syncs:
+            it["sy"] = syncs[it["id"]]
+    have = {it["id"] for it in items}
+    for n in new:
+        if n["id"] not in have:
+            n["sy"] = syncs.get(n["id"], "")
+            items.append(n)
+
+
+def pull_foreign(vals, list_name, items):
+    """アプリ形式ではないシート(自分で作った表)を読み取り専用で取り込む。シートは書き換えない。"""
+    if len(vals) < 2:
+        return {}, []
+    hdr = [h.strip().lower() for h in vals[0]]
+
+    def col(names):
+        for n in names:
+            if n in hdr:
+                return hdr.index(n)
+        return None
+    ti = col(["タイトル", "title", "名前", "作品名", "作品", "ファイル名", "題名", "name"])
+    ti = 0 if ti is None else ti
+    pi, gi, ji = col(["パス", "path"]), col(["グループ", "group"]), col(["ジャンル", "genre"])
+
+    def cell(r, i):
+        return r[i].strip() if i is not None and i < len(r) else ""
+    byid = {it["id"]: it for it in items}
+    updates, new, seen = {}, [], defaultdict(int)
+    for r in vals[1:]:
+        title = cell(r, ti)
+        if not title:
+            continue
+        path = cell(r, pi)
+        key = f"sheet:{list_name}:{title}:{path}"
+        seen[key] += 1
+        iid = item_id(key + (f"#{seen[key]}" if seen[key] > 1 else ""))
+        rec = {"title": title, "group": cell(r, gi), "genre": cell(r, ji), "path": path}
+        it = byid.get(iid)
+        if it is None:
+            new.append(dict(rec, id=iid, size=0, duration=0, mtime=0, hq="", hf="", thumb="", thumb_mode=0, flags=[]))
+        elif any(it.get(k) != v for k, v in rec.items()):
+            updates[iid] = rec
+    return updates, new
+
+
+def job_sheet_sync(s, cur_name, cur_items, cur_deleted, data_dir, cur_ro, q):
+    """全ての一覧 ⇔ シート(タブ)を同期。一覧名 = シート名。
+    シート側にだけある本アプリ形式のタブは一覧として追加する。"""
+    q.put(("status", "スプレッドシートと同期中…"))
+    sh = sheet_open(s)
+    tabs = {}
+    for ws in sh.worksheets():
+        tabs[ws.title] = (ws, ws.get_all_values())
+    store = Store(data_dir)
+    names = store.names()
+    foreign = set()
+    for t, (_ws, vals) in tabs.items():
+        if t not in names and not _blank(vals):
+            names.append(t)
+            if not _is_app_tab(vals):
+                foreign.add(t)
+    for n in store.names():
+        if n != cur_name and store.load(n).get("sheet_readonly"):
+            foreign.add(n)
+    if cur_name in cur_ro:
+        foreign.add(cur_name)
+    done = []
+    total_items = 0
+    for i, name in enumerate(names, 1):
+        q.put(("progress", i, len(names), f"スプレッドシート同期 ({i}/{len(names)}) {name}"))
+        ws, vals = tabs.get(name, (None, []))
+        if name == cur_name:
+            items, deleted = cur_items, cur_deleted
+        elif name in store.names():
+            d = store.load(name)
+            items, deleted = d["items"], d.get("deleted", {})
+        else:
+            items, deleted = [], {}
+        ro = name in foreign
+        if ro:
+            upd, new = pull_foreign(vals, name, items)
+            syncs = {}
+        else:
+            upd, new, syncs = sync_one(sh, ws, vals, name, items, deleted)
+        total_items += len(items) + len(new)
+        if name == cur_name:
+            q.put(("sheet_apply", upd, new, syncs))
+        else:
+            if name in store.names():
+                d = store.load(name)
+            else:
+                d = {"name": name, "items": [], "deleted": {}}
+            apply_sheet_result(d["items"], upd, new, syncs)
+            if ro:
+                d["sheet_readonly"] = True
+            store.save(name, d, merge=False)
+        done.append(name)
+    # 空の初期シート(シート1 / Sheet1)は、同期した一覧がある場合のみ片付ける
+    if done:
+        for t, (ws, vals) in tabs.items():
+            if t in ("シート1", "Sheet1") and _blank(vals) and t not in done:
+                try:
+                    sh.del_worksheet(ws)
+                except Exception:  # noqa
+                    pass
+    q.put(("status", f"スプレッドシート同期完了: {len(done)} 一覧 / {total_items} 件"))
+
+
+def job_sheet_rename(s, old, new, q):
+    sh = sheet_open(s)
+    for ws in sh.worksheets():
+        if ws.title == old:
+            ws.update_title(new)
+            return
+
+
+def job_sheet_delete(s, name, q):
+    sh = sheet_open(s)
+    for ws in sh.worksheets():
+        if ws.title == name and _is_app_tab(ws.get_all_values()):
+            sh.del_worksheet(ws)
+            return
+
+
+def job_sheet_dups(s, items, thr, q):
+    """スプレッドシート(全シート)の内容と、現在の一覧の重複を検索する。"""
+    q.put(("status", "スプレッドシートを読み込み中…"))
+    sh = sheet_open(s)
+    local_ids = {it["id"] for it in items}
+    recs = []
+    for ws in sh.worksheets():
+        vals = ws.get_all_values()
+        if len(vals) < 2:
+            continue
+        hdr = [h.strip().lower() for h in vals[0]]
+
+        def col(names):
+            for n in names:
+                if n in hdr:
+                    return hdr.index(n)
+            return None
+        ti = col(["タイトル", "title", "名前", "作品名", "作品", "ファイル名", "題名", "name"])
+        ti = 0 if ti is None else ti
+        pi, gi, ii = col(["パス", "path"]), col(["グループ", "group"]), col(["id"])
+
+        def cell(r, i):
+            return r[i].strip() if i is not None and i < len(r) else ""
+        for n, r in enumerate(vals[1:], 2):
+            title = cell(r, ti)
+            if not title or (ii is not None and cell(r, ii) in local_ids):
+                continue
+            recs.append({"sheet": ws.title, "row": n, "title": title, "path": cell(r, pi), "group": cell(r, gi)})
+    exact = defaultdict(list)
+    bypath = defaultdict(list)
+    for r in recs:
+        r["k"] = normalize_title(r["title"])
+        r["e"] = re.sub(r"\s+", "", unicodedata.normalize("NFKC", r["title"]).lower())
+        exact[r["e"]].append(r)
+        if r["path"]:
+            bypath[os.path.normcase(r["path"])].append(r)
+    out = {}
+    sm = difflib.SequenceMatcher(None, autojunk=False)
+    total = len(items)
+    for i, it in enumerate(items):
+        if i % 10 == 0:
+            q.put(("progress", i, total, f"スプレッドシートと照合中 ({i}/{total})"))
+        fl, seen = [], set()
+
+        def add(r, kind, score):
+            key = (r["sheet"], r["row"])
+            if key in seen:
+                return
+            seen.add(key)
+            fl.append({"id": f"sheet:{r['sheet']}:{r['row']}", "kind": kind, "score": round(score, 3), "sheet": True,
+                       "name": f"[{r['sheet']}] {r['title']}", "path": f"シート「{r['sheet']}」 {r['row']}行目 {r['path']}".strip()})
+        for r in bypath.get(os.path.normcase(it["path"]), []):
+            add(r, "same", 1.0)
+        e = re.sub(r"\s+", "", unicodedata.normalize("NFKC", it["title"]).lower())
+        for r in exact.get(e, []):
+            add(r, "same", 1.0)
+        k = normalize_title(it["title"])
+        if len(k) >= 3:
+            sm.set_seq2(k)
+            for r in recs:
+                if len(r["k"]) < 3 or (it["group"] and it["group"] == r["group"]):
+                    continue
+                sm.set_seq1(r["k"])
+                if sm.real_quick_ratio() < thr or sm.quick_ratio() < thr:
+                    continue
+                sc = sm.ratio()
+                if sc >= thr:
+                    add(r, "similar", sc)
+        fl.sort(key=lambda f: (f["kind"] != "same", -f["score"]))
+        out[it["id"]] = fl[:8]
+    q.put(("sheet_flags", out, len(recs)))
+
+
 # ----------------------------------------------------------------- ダイアログ
 class PickDialog(tk.Toplevel):
     def __init__(self, parent, title, label, values, initial="", editable=True):
@@ -533,6 +854,17 @@ class SettingsDialog(tk.Toplevel):
         self.pm = tk.Text(self, width=60, height=3)
         self.pm.pack(padx=12)
         self.pm.insert("1.0", "\n".join(f"{a}={b}" for a, b in s.get("path_map", [])))
+        ttk.Label(self, text="スプレッドシート連携 (Google Sheets API / pip install gspread)").pack(anchor="w", **pad)
+        self.sheet = tk.StringVar(value=s.get("sheet_url", ""))
+        ttk.Entry(self, textvariable=self.sheet, width=62).pack(padx=12)
+        ttk.Label(self, text="↑ スプレッドシートのURL / 下: client_secret.json(OAuth)またはサービスアカウントのJSON").pack(anchor="w", padx=12)
+        self.sa = tk.StringVar(value=s.get("sa_json", ""))
+        fr = ttk.Frame(self)
+        fr.pack(fill="x", **pad)
+        ttk.Entry(fr, textvariable=self.sa, width=52).pack(side="left", fill="x", expand=True)
+        ttk.Button(fr, text="JSON参照", command=self.browse_sa).pack(side="left", padx=4)
+        self.auto = tk.BooleanVar(value=s.get("sheet_auto", False))
+        ttk.Checkbutton(self, text="変更後に自動でスプレッドシートへ同期する(約1分ごと)", variable=self.auto).pack(anchor="w", padx=12)
         fr = ttk.Frame(self)
         fr.pack(pady=12)
         ttk.Button(fr, text="OK", command=self.ok).pack(side="left", padx=6)
@@ -545,6 +877,12 @@ class SettingsDialog(tk.Toplevel):
         if d:
             self.dir.set(os.path.normpath(d))
 
+    def browse_sa(self):
+        f = filedialog.askopenfilename(parent=self, title="サービスアカウントのJSONキー",
+                                       filetypes=[("JSON", "*.json"), ("すべて", "*.*")])
+        if f:
+            self.sa.set(os.path.normpath(f))
+
     def ok(self):
         try:
             thr = min(1.0, max(0.5, float(self.thr.get())))
@@ -552,7 +890,9 @@ class SettingsDialog(tk.Toplevel):
             thr = 0.8
         self.result = {"data_dir": self.dir.get().strip(), "thumb_mode": self.mode.get(),
                        "hash_mode": self.hash.get(), "sim_threshold": thr,
-                       "path_map": parse_pmap(self.pm.get("1.0", "end"))}
+                       "path_map": parse_pmap(self.pm.get("1.0", "end")),
+                       "sheet_url": self.sheet.get().strip(), "sa_json": self.sa.get().strip(),
+                       "sheet_auto": bool(self.auto.get())}
         self.destroy()
 
 
@@ -573,10 +913,14 @@ class App(tk.Tk):
         self.by_id = {}
         self.open_groups = set()
         self.store = None
+        self.move_errs = []
+        self.job_kind = ""
+        self.sheet_dirty = False
         self.build_ui()
         self.open_store()
         self.after(100, self.poll)
         self.after(5000, self.watch_external)
+        self.after(60000, self.auto_sheet)
         publish_app(self.settings["data_dir"])
         self.protocol("WM_DELETE_WINDOW", self.destroy)
 
@@ -595,7 +939,13 @@ class App(tk.Tk):
         ttk.Button(top, text="📁 フォルダ読込", command=self.import_folder).pack(side="left", padx=2)
         ttk.Button(top, text="重複チェック", command=self.recheck).pack(side="left", padx=2)
         ttk.Button(top, text="サムネ再作成", command=self.regen_thumbs).pack(side="left", padx=2)
+        ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=8)
+        ttk.Button(top, text="📊 スプシ同期", command=self.sheet_sync).pack(side="left", padx=2)
+        ttk.Button(top, text="スプシと重複検索", command=self.sheet_dups).pack(side="left", padx=2)
         ttk.Button(top, text="⚙ 設定", command=self.open_settings).pack(side="right")
+        self.side_btn = ttk.Button(top, text="▶ 詳細パネルを隠す (F4)", command=self.toggle_side)
+        self.side_btn.pack(side="right", padx=4)
+        self.bind("<F4>", lambda e: self.toggle_side())
 
         bar = ttk.Frame(self)
         bar.pack(fill="x", padx=8, pady=(0, 6))
@@ -617,28 +967,43 @@ class App(tk.Tk):
         body = ttk.PanedWindow(self, orient="horizontal")
         body.pack(fill="both", expand=True, padx=8)
         left = ttk.Frame(body)
-        body.add(left, weight=4)
+        body.add(left, weight=1)
         cols = ("genre", "count", "dur", "size", "flag", "path")
         self.tree = ttk.Treeview(left, columns=cols, selectmode="extended")
         heads = {"#0": ("タイトル / グループ", 300), "genre": ("ジャンル", 90), "count": ("話数", 50),
                  "dur": ("時間", 70), "size": ("サイズ", 70), "flag": ("同一・類似", 260), "path": ("パス", 300)}
         for c, (t, w) in heads.items():
             self.tree.heading(c, text=t)
-            self.tree.column(c, width=w, anchor="w", stretch=(c in ("#0", "flag")))
+            w = int(self.settings.get("col_widths", {}).get(c, w))
+            # stretch=False: 列幅を広げても他の列が自動で縮まない(広げたまま保持)
+            self.tree.column(c, width=w, minwidth=40, anchor="w", stretch=False)
         self.tree.tag_configure("same", background="#ffd0d0")
         self.tree.tag_configure("similar", background="#fff1b8")
         self.tree.tag_configure("group", font=("Yu Gothic UI", 10, "bold"))
         sb = ttk.Scrollbar(left, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="left", fill="y")
+        hsb = ttk.Scrollbar(left, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=sb.set, xscrollcommand=hsb.set)
+        left.rowconfigure(0, weight=1)
+        left.columnconfigure(0, weight=1)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        self.tree.bind("<ButtonRelease-1>", lambda e: self.after_idle(self.save_col_widths), add="+")
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
         self.tree.bind("<Double-1>", self.on_double)
         self.tree.bind("<Button-3>", self.on_right)
         self.tree.bind("<Delete>", lambda e: self.remove_selected())
 
-        right = ttk.Frame(body, width=420)
-        body.add(right, weight=2)
+        right = ttk.Frame(body, width=int(self.settings.get("side_w", 300)))
+        self.body, self.right = body, right
+        self.thumb_w, self.thumb_it = 280, None
+        if self.settings.get("side_show", True):
+            body.add(right, weight=0)
+        if not self.settings.get("side_show", True):
+            self.side_btn.config(text="◀ 詳細パネルを表示 (F4)")
+        right.bind("<Configure>", self.on_side_resize)
+        self._side_init = body.bind("<Configure>", self._first_layout, add="+")
+        body.bind("<ButtonRelease-1>", lambda e: self.after_idle(self.save_side_w), add="+")
         self.thumb_lbl = ttk.Label(right, text="(サムネイルなし)", anchor="center")
         self.thumb_lbl.pack(fill="x", pady=(0, 6))
         self.detail = tk.Text(right, wrap="word", height=20, state="disabled", relief="flat",
@@ -652,7 +1017,8 @@ class App(tk.Tk):
 
         self.menu = tk.Menu(self, tearoff=0)
         for text, cmd in (("ジャンルを設定…", self.set_genre), ("グループを設定/解除…", self.set_group),
-                          ("別の一覧へ移動…", self.move_to_list), (None, None),
+                          ("別の一覧へ移動…", self.move_to_list),
+                          ("ファイルを別フォルダへ移動…", self.move_files), (None, None),
                           ("ファイルを開く", self.open_file), ("フォルダを開く", self.open_folder), (None, None),
                           ("一覧から削除 (ファイルは消えません)", self.remove_selected)):
             if text is None:
@@ -695,6 +1061,7 @@ class App(tk.Tk):
     def after_data_change(self, save=True):
         if save:
             self.store.save(self.cur_name, self.data)
+            self.sheet_dirty = True
         self.by_id = {it["id"]: it for it in self.data["items"]}
         gs = sorted({it["genre"] for it in self.data["items"] if it["genre"]})
         self.g_cb["values"] = ["すべて", "(未設定)"] + gs
@@ -723,8 +1090,11 @@ class App(tk.Tk):
         if not self.store.valid_name(v) or v in self.store.names():
             messagebox.showwarning("変更できません", "名前が空・重複、または使えない文字が含まれています。")
             return
-        self.store.rename(self.cur_name, v)
+        old = self.cur_name
+        self.store.rename(old, v)
         self.switch_list(v)
+        if self.sheet_ready():
+            self.run_job(job_sheet_rename, self.settings, old, v)
 
     def delete_list(self):
         if self.busy:
@@ -734,10 +1104,15 @@ class App(tk.Tk):
             return
         n = len(self.data["items"])
         if not messagebox.askyesno("一覧の削除", f"一覧「{self.cur_name}」({n}件)を削除します。\n"
-                                   "動画ファイル自体は削除されません。よろしいですか?"):
+                                   "動画ファイル自体は削除されません。"
+                                   + ("\nスプレッドシートの同名シートも削除されます。" if self.sheet_ready() else "")
+                                   + "\nよろしいですか?"):
             return
-        self.store.delete(self.cur_name)
+        old = self.cur_name
+        self.store.delete(old)
         self.switch_list(self.store.names()[0])
+        if self.sheet_ready():
+            self.run_job(job_sheet_delete, self.settings, old)
 
     # ---- 読み込み / ジョブ
     def run_job(self, fn, *args):
@@ -745,6 +1120,7 @@ class App(tk.Tk):
             messagebox.showinfo("処理中", "別の処理が実行中です。完了までお待ちください。")
             return
         self.busy = True
+        self.job_kind = fn.__name__
         self.list_cb.configure(state="disabled")
 
         def target():
@@ -783,6 +1159,62 @@ class App(tk.Tk):
             pass
         self.after(5000, self.watch_external)
 
+    def save_col_widths(self):
+        w = {c: int(self.tree.column(c, "width")) for c in ("#0",) + tuple(self.tree["columns"])}
+        if w != self.settings.get("col_widths"):
+            self.settings["col_widths"] = w
+            try:
+                save_settings(self.settings)
+            except OSError:
+                pass
+
+    def sheet_ready(self):
+        return bool(self.settings.get("sheet_url") and self.settings.get("sa_json"))
+
+    def sheet_sync(self, auto=False):
+        if self.busy:
+            return
+        s = self.settings
+        if not s.get("sheet_url") or not s.get("sa_json"):
+            if not auto:
+                messagebox.showinfo("スプレッドシート", "先に 設定 でスプレッドシートのURLとサービスアカウントJSONを指定してください。")
+            return
+        self.sheet_dirty = False
+        self.run_job(job_sheet_sync, s, self.cur_name, self.snapshot(), dict(self.data.get("deleted", {})),
+                     self.store.root, {self.cur_name} if self.data.get("sheet_readonly") else set())
+
+    def sheet_dups(self):
+        if self.busy:
+            return
+        s = self.settings
+        if not s.get("sheet_url") or not s.get("sa_json"):
+            messagebox.showinfo("スプレッドシート", "先に 設定 でスプレッドシートのURLとサービスアカウントJSONを指定してください。")
+            return
+        self.run_job(job_sheet_dups, s, self.snapshot(), s["sim_threshold"])
+
+    def auto_sheet(self):
+        if self.settings.get("sheet_auto") and self.sheet_dirty and not self.busy:
+            self.sheet_sync(auto=True)
+        self.after(60000, self.auto_sheet)
+
+    def move_files(self):
+        items = self.selected_items()
+        if not items or self.busy:
+            return
+        d = filedialog.askdirectory(parent=self, title=f"{len(items)} 件の移動先フォルダを選択")
+        if not d:
+            return
+        d = os.path.normpath(d)
+        r = messagebox.askyesnocancel(
+            "ファイルの移動",
+            f"{len(items)} 件の動画ファイルを実際に移動します。\n移動先: {d}\n\n"
+            "あわせてグループ名を移動先のフォルダ名に変更しますか?\n"
+            "はい: グループも変更 / いいえ: グループはそのまま / キャンセル: 移動しない")
+        if r is None:
+            return
+        self.move_errs = []
+        self.run_job(job_move, [(it["id"], self.lpath(it)) for it in items], d, r, self.pmap())
+
     def import_folder(self):
         if self.busy:
             return
@@ -813,6 +1245,7 @@ class App(tk.Tk):
 
     def poll(self):
         changed = False
+        sync_done = False
         try:
             while True:
                 m = self.q.get_nowait()
@@ -833,10 +1266,28 @@ class App(tk.Tk):
                         if m[2]:
                             it["duration"] = m[2]
                         it["thumb"], it["thumb_mode"] = m[3], m[4]
+                elif k == "moved":
+                    it = self.by_id.get(m[1])
+                    if it:
+                        it["path"] = m[2]
+                        if m[3] is not None:
+                            it["group"] = m[3]
+                        changed = True
+                elif k == "move_err":
+                    self.move_errs.append(m[1])
+                elif k == "sheet_apply":
+                    apply_sheet_result(self.data["items"], m[1], m[2], m[3])
+                    changed = True
+                elif k == "sheet_flags":
+                    for it in self.data["items"]:
+                        old = [f for f in it.get("flags", []) if not f.get("sheet")]
+                        it["flags"] = old + m[1].get(it["id"], [])
+                    changed = True
+                    self.status.config(text=f"スプレッドシート {m[2]} 行と照合しました")
                 elif k == "flags":
                     flags, newhash = m[1], m[2]
                     for it in self.data["items"]:
-                        it["flags"] = flags.get(it["id"], [])
+                        it["flags"] = flags.get(it["id"], []) + [f for f in it.get("flags", []) if f.get("sheet")]
                         if it["id"] in newhash:
                             hk, hv = newhash[it["id"]]
                             it[hk] = hv
@@ -848,12 +1299,23 @@ class App(tk.Tk):
                     self.list_cb.configure(state="readonly")
                     self.pb.configure(value=0)
                     nf = sum(1 for it in self.data["items"] if it.get("flags"))
-                    self.status.config(text=f"完了 — 同一/類似の疑い: {nf} 件")
+                    if self.job_kind not in ("job_sheet_sync", "job_move", "job_sheet_dups", "job_sheet_rename", "job_sheet_delete"):
+                        self.status.config(text=f"完了 — 同一/類似の疑い: {nf} 件")
                     changed = True
+                    if self.move_errs:
+                        messagebox.showwarning("移動できなかったファイル", "\n".join(self.move_errs[:20]))
+                        self.move_errs = []
+                    if self.job_kind == "job_move":
+                        self.status.config(text="ファイルの移動が完了しました")
+                    if self.job_kind == "job_sheet_sync":
+                        sync_done = True
+                        self.list_cb["values"] = self.store.names()
         except queue.Empty:
             pass
         if changed:
             self.after_data_change()
+            if sync_done:
+                self.sheet_dirty = False
         self.after(150, self.poll)
 
     # ---- ツリー表示
@@ -979,7 +1441,12 @@ class App(tk.Tk):
                 self.write("\n⚠ 同一・類似の疑い (クリックで移動)\n", "h")
             for n, f in enumerate(fl):
                 tag = f"lnk{n}"
-                if f["kind"] == "same":
+                if f.get("sheet"):
+                    self.write("\n■ スプレッドシートと重複 " + ("(同じタイトル/パス)" if f["kind"] == "same"
+                                                         else f"(類似 {int(f['score'] * 100)}%)") + "\n",
+                               "same_t" if f["kind"] == "same" else "sim_t")
+                    self.write("  → " + f["name"] + "\n")
+                elif f["kind"] == "same":
                     self.write("\n■ 同一動画 ", "same_t")
                     self.write("(ファイル内容のハッシュが一致)\n")
                     self.write("  → ", )
@@ -1001,11 +1468,56 @@ class App(tk.Tk):
                 self.detail.tag_bind(tag, "<Leave>", lambda e: self.detail.config(cursor=""))
         self.detail.configure(state="disabled")
 
+    def on_side_resize(self, e):
+        w = max(120, min(480, e.width - 8))
+        if abs(w - self.thumb_w) >= 12:
+            self.thumb_w = w
+            if self.thumb_it is not None:
+                self.set_thumb(self.thumb_it)
+
+    def _first_layout(self, e):
+        if e.width > 600:
+            self.body.unbind("<Configure>", self._side_init)
+            self.after_idle(self.apply_side_w)
+
+    def apply_side_w(self):
+        try:
+            if str(self.right) in self.body.panes():
+                self.body.sashpos(0, max(300, self.body.winfo_width() - int(self.settings.get("side_w", 300))))
+        except tk.TclError:
+            pass
+
+    def save_side_w(self):
+        if str(self.right) in self.body.panes():
+            w = self.right.winfo_width()
+            if w > 100 and w != self.settings.get("side_w"):
+                self.settings["side_w"] = w
+                try:
+                    save_settings(self.settings)
+                except OSError:
+                    pass
+
+    def toggle_side(self):
+        show = str(self.right) not in self.body.panes()
+        if show:
+            self.body.add(self.right, weight=0)
+            self.update_idletasks()
+            self.apply_side_w()
+        else:
+            self.body.forget(self.right)
+        self.settings["side_show"] = show
+        self.side_btn.config(text="◀ 詳細パネルを表示 (F4)" if not show else "▶ 詳細パネルを隠す (F4)")
+        try:
+            save_settings(self.settings)
+        except OSError:
+            pass
+
     def set_thumb(self, it):
+        self.thumb_it = it
         p = os.path.join(self.store.thumbs_dir, it["thumb"]) if it and it.get("thumb") else ""
         try:
             im = Image.open(p)
-            im.thumbnail((420, 236))
+            im.thumbnail((self.thumb_w, int(self.thumb_w * 9 / 16)))
             self.photo = ImageTk.PhotoImage(im)
             self.thumb_lbl.configure(image=self.photo, text="")
         except Exception:

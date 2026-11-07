@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+token.json
+client_secret*.json
+credentials.json
